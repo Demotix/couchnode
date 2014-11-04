@@ -1,3 +1,20 @@
+/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+/*
+ *     Copyright 2014 Couchbase, Inc.
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ */
+
 #include "mcreq.h"
 #include "forward.h"
 #include "iovcursor-inl.h"
@@ -89,7 +106,7 @@ mc_forward_packet(mc_CMDQUEUE *cq,
         kptr = kbuf_s;
     }
 
-    vbucket_map(cq->config, kptr, n_body_key, &vbid, &srvix);
+    lcbvb_map_key(cq->config, kptr, n_body_key, &vbid, &srvix);
     if (srvix < 0 || (unsigned)srvix >= cq->npipelines) {
         return LCB_NO_MATCHING_SERVER;
     }

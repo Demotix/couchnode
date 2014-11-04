@@ -18,6 +18,9 @@
 #include "internal.h"
 #include "clconfig.h"
 #include "simplestring.h"
+#include <lcbio/lcbio.h>
+#include <lcbio/timer-ng.h>
+
 #define CONFIG_CACHE_MAGIC "{{{fb85b563d0a8f65fa8d3d58f1b3a0708}}}"
 
 #define LOGARGS(pb, lvl) pb->base.parent->settings, "bc_file", LCB_LOG_##lvl, __FILE__, __LINE__
@@ -30,7 +33,7 @@ typedef struct {
     clconfig_info *config;
     time_t last_mtime;
     int last_errno;
-    lcb_async_t async;
+    lcbio_pTIMER timer;
     clconfig_listener listener;
 } file_provider;
 
@@ -41,7 +44,7 @@ static int load_cache(file_provider *provider)
     lcb_ssize_t nr;
     int fail;
     FILE *fp = NULL;
-    VBUCKET_CONFIG_HANDLE config = NULL;
+    lcbvb_CONFIG *config = NULL;
     char *end;
     struct stat st;
     int status = -1;
@@ -69,7 +72,7 @@ static int load_cache(file_provider *provider)
         goto GT_DONE;
     }
 
-    config = vbucket_config_create();
+    config = lcbvb_create();
     if (config == NULL) {
         goto GT_DONE;
     }
@@ -102,7 +105,7 @@ static int load_cache(file_provider *provider)
         goto GT_DONE;
     }
 
-    fail = vbucket_config_parse(config, LIBVBUCKET_SOURCE_MEMORY, str.base);
+    fail = lcbvb_load_json(config, str.base);
     if (fail) {
         status = -1;
         lcb_log(LOGARGS(provider, ERROR), LOGFMT "Couldn't parse configuration", LOGID(provider));
@@ -110,7 +113,7 @@ static int load_cache(file_provider *provider)
         goto GT_DONE;
     }
 
-    if (vbucket_config_get_distribution_type(config) != VBUCKET_DISTRIBUTION_VBUCKET) {
+    if (lcbvb_get_distmode(config) != LCBVB_DIST_VBUCKET) {
         status = -1;
         lcb_log(LOGARGS(provider, ERROR), LOGFMT "Not applying cached memcached config", LOGID(provider));
         goto GT_DONE;
@@ -133,7 +136,7 @@ static int load_cache(file_provider *provider)
     }
 
     if (config != NULL) {
-        vbucket_config_destroy(config);
+        lcbvb_destroy(config);
     }
 
     lcb_string_release(&str);
@@ -172,16 +175,10 @@ static clconfig_info * get_cached(clconfig_provider *pb)
     return provider->config;
 }
 
-static void async_callback(lcb_timer_t timer,
-                           lcb_t notused,
-                           const void *cookie)
+static void async_callback(void *cookie)
 {
     time_t last_mtime;
     file_provider *provider = (file_provider *)cookie;
-    lcb_async_destroy(NULL, timer);
-    provider->async = NULL;
-
-
     last_mtime = provider->last_mtime;
     if (load_cache(provider) == 0) {
         if (last_mtime != provider->last_mtime) {
@@ -191,27 +188,17 @@ static void async_callback(lcb_timer_t timer,
     }
 
     lcb_confmon_provider_failed(&provider->base, LCB_ERROR);
-    (void)notused;
 }
 
 static lcb_error_t refresh_file(clconfig_provider *pb)
 {
     file_provider *provider = (file_provider *)pb;
-    lcb_error_t err;
-
-    if (provider->async) {
+    if (lcbio_timer_armed(provider->timer)) {
         return LCB_SUCCESS;
     }
 
-    provider->async = lcb_async_create(pb->parent->iot,
-                                       pb,
-                                       async_callback,
-                                       &err);
-
-    lcb_assert(err == LCB_SUCCESS);
-    lcb_assert(provider->async != NULL);
-
-    return err;
+    lcbio_async_signal(provider->timer);
+    return LCB_SUCCESS;
 }
 
 static lcb_error_t pause_file(clconfig_provider *pb)
@@ -224,6 +211,9 @@ static void shutdown_file(clconfig_provider *pb)
 {
     file_provider *provider = (file_provider *)pb;
     free(provider->filename);
+    if (provider->timer) {
+        lcbio_timer_destroy(provider->timer);
+    }
     if (provider->config) {
         lcb_clconfig_decref(provider->config);
     }
@@ -252,6 +242,21 @@ static void config_listener(clconfig_listener *lsn, clconfig_event_t event,
     write_to_file(provider, info->vbc);
 }
 
+static void
+do_file_dump(clconfig_provider *pb, FILE *fp)
+{
+    file_provider *pr = (file_provider *)pb;
+
+    fprintf(fp, "## BEGIN FILE PROVIEDER DUMP ##\n");
+    if (pr->filename) {
+        fprintf(fp, "FILENAME: %s\n", pr->filename);
+    }
+    fprintf(fp, "LAST SYSTEM ERRNO: %d\n", pr->last_errno);
+    fprintf(fp, "LAST MTIME: %lu\n", (unsigned long)pr->last_mtime);
+    fprintf(fp, "## END FILE PROVIDER DUMP ##\n");
+
+}
+
 clconfig_provider * lcb_clconfig_create_file(lcb_confmon *parent)
 {
     file_provider *provider = calloc(1, sizeof(*provider));
@@ -264,8 +269,10 @@ clconfig_provider * lcb_clconfig_create_file(lcb_confmon *parent)
     provider->base.refresh = refresh_file;
     provider->base.pause = pause_file;
     provider->base.shutdown = shutdown_file;
+    provider->base.dump = do_file_dump;
     provider->base.type = LCB_CLCONFIG_FILE;
     provider->listener.callback = config_listener;
+    provider->timer = lcbio_timer_new(parent->iot, provider, async_callback);
 
     lcb_confmon_add_listener(parent, &provider->listener);
 

@@ -1,3 +1,20 @@
+/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+/*
+ *     Copyright 2014 Couchbase, Inc.
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ */
+
 #include "packetutils.h"
 #include "simplestring.h"
 #include "mcserver.h"
@@ -32,7 +49,6 @@ struct mc_SESSINFO {
         char buffer[256];
     } u_auth;
     cbsasl_callback_t sasl_callbacks[4];
-    lcb_U16 features[MEMCACHED_TOTAL_HELLO_FEATURES+1];
 };
 
 /**
@@ -175,6 +191,8 @@ timeout_handler(void *arg)
 
 /**
  * Called to retrive the mechlist from the packet.
+ * @return 0 to continue authentication, 1 if no authentication needed, or
+ * -1 on error.
  */
 static int
 set_chosen_mech(mc_pSESSREQ sreq, lcb_string *mechlist, const char **data,
@@ -202,18 +220,23 @@ set_chosen_mech(mc_pSESSREQ sreq, lcb_string *mechlist, const char **data,
 
     saslerr = cbsasl_client_start(ctx->sasl, mechlist->base,
                                   NULL, data, ndata, &chosenmech);
-    if (saslerr != SASL_OK) {
+    switch (saslerr) {
+    case SASL_OK:
+        ctx->nmech = strlen(chosenmech);
+        if (! (ctx->mech = strdup(chosenmech)) ) {
+            set_error_ex(sreq, LCB_CLIENT_ENOMEM, NULL);
+            return -1;
+        }
+        return 0;
+    case SASL_NOMECH:
+        lcb_log(LOGARGS(sreq, INFO), SESSREQ_LOGFMT "Server does not support SASL (no mechanisms supported)", SESSREQ_LOGID(sreq));
+        return 1;
+        break;
+    default:
+        lcb_log(LOGARGS(sreq, INFO), SESSREQ_LOGFMT "cbsasl_client_start returned %d", SESSREQ_LOGID(sreq), saslerr);
         set_error_ex(sreq, LCB_EINTERNAL, "Couldn't start SASL client");
         return -1;
     }
-
-    ctx->nmech = strlen(chosenmech);
-    if (! (ctx->mech = strdup(chosenmech)) ) {
-        set_error_ex(sreq, LCB_CLIENT_ENOMEM, NULL);
-        return -1;
-    }
-
-    return 0;
 }
 
 /**
@@ -273,62 +296,9 @@ send_sasl_step(mc_pSESSREQ sreq, packet_info *packet)
     return 0;
 }
 
-static int
-send_hello(mc_pSESSREQ sreq)
-{
-    protocol_binary_request_no_extras req;
-    protocol_binary_request_header *hdr = &req.message.header;
-    unsigned ii;
-    static const char client_id[] = LCB_VERSION_STRING;
-    lcb_U16 features[MEMCACHED_TOTAL_HELLO_FEATURES];
-    unsigned nfeatures = 0;
-    lcb_SIZE nclistr;
-
-    features[nfeatures++] = PROTOCOL_BINARY_FEATURE_TLS;
-    if (sreq->inner->settings->compressopts != LCB_COMPRESS_NONE) {
-        features[nfeatures++] = PROTOCOL_BINARY_FEATURE_DATATYPE;
-    }
-
-    nclistr = strlen(client_id);
-    memset(&req, 0, sizeof req);
-    hdr->request.opcode = PROTOCOL_BINARY_CMD_HELLO;
-    hdr->request.magic = PROTOCOL_BINARY_REQ;
-    hdr->request.keylen = htons((lcb_U16)nclistr);
-    hdr->request.bodylen = htonl((lcb_U32)(nclistr+ (sizeof features[0]) * nfeatures));
-    hdr->request.datatype = PROTOCOL_BINARY_RAW_BYTES;
-
-    lcbio_ctx_put(sreq->ctx, req.bytes, sizeof req.bytes);
-    lcbio_ctx_put(sreq->ctx, client_id, strlen(client_id));
-    for (ii = 0; ii < nfeatures; ii++) {
-        lcb_U16 tmp = htons(features[ii]);
-        lcbio_ctx_put(sreq->ctx, &tmp, sizeof tmp);
-    }
-    lcbio_ctx_rwant(sreq->ctx, 24);
-    return 0;
-}
-
-static int
-parse_hello(mc_pSESSREQ sreq, packet_info *packet)
-{
-    /* some caps */
-    const char *cur;
-    const char *payload = PACKET_BODY(packet);
-    const char *limit = payload + PACKET_NBODY(packet);
-    for (cur = payload; cur < limit; cur += 2) {
-        lcb_U16 tmp;
-        memcpy(&tmp, cur, sizeof(tmp));
-        tmp = ntohs(tmp);
-        lcb_log(LOGARGS(sreq, DEBUG), SESSREQ_LOGFMT "Found feature 0x%x (%s)", SESSREQ_LOGID(sreq), tmp, protocol_feature_2_text(tmp));
-        sreq->inner->features[tmp] = 1;
-    }
-    return 0;
-}
-
-
 typedef enum {
     SREQ_S_WAIT,
     SREQ_S_AUTHDONE,
-    SREQ_S_HELLODONE,
     SREQ_S_ERROR
 } sreq_STATE;
 
@@ -362,6 +332,7 @@ handle_read(lcbio_CTX *ioctx, unsigned nb)
     switch (PACKET_OPCODE(&info)) {
     case PROTOCOL_BINARY_CMD_SASL_LIST_MECHS: {
         lcb_string str;
+        int saslrc;
         const char *mechlist_data;
         unsigned int nmechlist_data;
         if (lcb_string_init(&str)) {
@@ -376,11 +347,20 @@ handle_read(lcbio_CTX *ioctx, unsigned nb)
             state = SREQ_S_ERROR;
             break;
         }
-        if (0 == set_chosen_mech(sreq, &str, &mechlist_data, &nmechlist_data) &&
-                0 == send_sasl_auth(sreq, mechlist_data, nmechlist_data)) {
-            state = SREQ_S_WAIT;
-        } else {
+
+        saslrc = set_chosen_mech(sreq, &str, &mechlist_data, &nmechlist_data);
+        if (saslrc == 0) {
+            if (0 == send_sasl_auth(sreq, mechlist_data, nmechlist_data)) {
+                state = SREQ_S_WAIT;
+            } else {
+                state = SREQ_S_ERROR;
+            }
+
+        } else if (saslrc < 0) {
             state = SREQ_S_ERROR;
+
+        } else {
+            state = SREQ_S_AUTHDONE;
         }
         lcb_string_release(&str);
         break;
@@ -388,7 +368,6 @@ handle_read(lcbio_CTX *ioctx, unsigned nb)
 
     case PROTOCOL_BINARY_CMD_SASL_AUTH: {
         if (status == PROTOCOL_BINARY_RESPONSE_SUCCESS) {
-            send_hello(sreq);
             state = SREQ_S_AUTHDONE;
             break;
         }
@@ -398,7 +377,7 @@ handle_read(lcbio_CTX *ioctx, unsigned nb)
             state = SREQ_S_ERROR;
             break;
         }
-        if (send_sasl_step(sreq, &info) == 0 && send_hello(sreq) == 0) {
+        if (send_sasl_step(sreq, &info) == 0) {
             state = SREQ_S_WAIT;
         } else {
             state = SREQ_S_ERROR;
@@ -417,21 +396,6 @@ handle_read(lcbio_CTX *ioctx, unsigned nb)
         break;
     }
 
-    case PROTOCOL_BINARY_CMD_HELLO: {
-        state = SREQ_S_HELLODONE;
-        if (status == PROTOCOL_BINARY_RESPONSE_SUCCESS) {
-            parse_hello(sreq, &info);
-        } else if (status == PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND ||
-                status == PROTOCOL_BINARY_RESPONSE_NOT_SUPPORTED) {
-            lcb_log(LOGARGS(sreq, DEBUG), SESSREQ_LOGFMT "Server does not support HELLO", SESSREQ_LOGID(sreq));
-            /* nothing */
-        } else {
-            set_error_ex(sreq, LCB_PROTOCOL_ERROR, "Hello response unexpected");
-            state = SREQ_S_ERROR;
-        }
-        break;
-    }
-
     default: {
         state = SREQ_S_ERROR;
         lcb_log(LOGARGS(sreq, ERROR), SESSREQ_LOGFMT "Received unknown response. OP=0x%x. RC=0x%x", SESSREQ_LOGID(sreq), PACKET_OPCODE(&info), PACKET_STATUS(&info));
@@ -445,7 +409,7 @@ handle_read(lcbio_CTX *ioctx, unsigned nb)
         bail_pending(sreq);
     } else if (state == SREQ_S_ERROR) {
         set_error_ex(sreq, LCB_ERROR, "FIXME: Error code set without description");
-    } else if (state == SREQ_S_HELLODONE) {
+    } else if (state == SREQ_S_AUTHDONE) {
         negotiation_success(sreq);
     } else {
         goto GT_NEXT_PACKET;
@@ -591,8 +555,5 @@ mc_sess_get_saslmech(mc_pSESSINFO info)
 int
 mc_sess_chkfeature(mc_pSESSINFO info, lcb_U16 feature)
 {
-    if (feature > MEMCACHED_TOTAL_HELLO_FEATURES) {
-        return 0;
-    }
-    return info->features[feature];
+    (void)info; (void)feature; return 0;
 }

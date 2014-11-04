@@ -5,16 +5,19 @@
 #include "common/histogram.h"
 
 namespace cbc {
-#define HANDLER_DESCRIPTION(s) std::string description() const { return s; }
+#define HANDLER_DESCRIPTION(s) const char* description() const { return s; }
+#define HANDLER_USAGE(s) const char* usagestr() const { return s; }
 class Handler {
 public:
     Handler(const char *name);
     virtual ~Handler();
-    virtual std::string description() const = 0;
+    virtual const char * description() const = 0;
+    virtual const char * usagestr() const { return NULL; }
     void execute(int argc, char **argv);
 
 protected:
-    virtual const std::string& getRequiredArg();
+    virtual const std::string& getLoneArg(bool required = false);
+    virtual const std::string& getRequiredArg() { return getLoneArg(true); }
     virtual void addOptions();
     virtual void run();
     cliopts::Parser parser;
@@ -30,7 +33,7 @@ public:
     GetHandler(const char *name = "get") :
         Handler(name), o_replica("replica"), o_exptime("expiry") {}
 
-    std::string description() const {
+    const char* description() const {
         if (isLock()) {
             return "Lock keys and retrieve them from the cluster";
         } else {
@@ -51,7 +54,7 @@ private:
 class SetHandler : public Handler {
 public:
     SetHandler(const char *name = "create") : Handler(name),
-        o_flags("flags"), o_exp("ttl"), o_add("add"), o_persist("persist-to"),
+        o_flags("flags"), o_exp("expiry"), o_add("add"), o_persist("persist-to"),
         o_replicate("replicate-to"), o_value("value"), o_json("json") {
 
         o_flags.abbrev('f').description("Flags for item");
@@ -63,11 +66,19 @@ public:
         o_json.abbrev('J').description("Indicate to the server that this item is JSON");
     }
 
-    std::string description() const {
+    const char* description() const {
         if (hasFileList()) {
             return "Store files to the server";
         } else {
             return "Store item to the server";
+        }
+    }
+
+    const char* usagestr() const {
+        if (hasFileList()) {
+            return "[OPTIONS...] FILE ...";
+        } else {
+            return "[OPTIONS...] KEY -V VALUE";
         }
     }
 
@@ -93,6 +104,7 @@ private:
 class HashHandler : public Handler {
 public:
     HANDLER_DESCRIPTION("Get mapping information for keys")
+    HANDLER_USAGE("KEY ... [OPTIONS ...]")
     HashHandler() : Handler("hash") {}
 protected:
     void run();
@@ -102,6 +114,7 @@ class ObserveHandler : public Handler {
 public:
     ObserveHandler() : Handler("observe") { }
     HANDLER_DESCRIPTION("Obtain persistence and replication status for keys")
+    HANDLER_USAGE("KEY ... ")
 protected:
     void run();
 };
@@ -109,6 +122,7 @@ protected:
 class UnlockHandler : public Handler {
 public:
     HANDLER_DESCRIPTION("Unlock keys")
+    HANDLER_USAGE("KEY CAS [OPTIONS ...]")
     UnlockHandler() : Handler("unlock") {}
 protected:
     void run();
@@ -125,6 +139,7 @@ public:
 class RemoveHandler : public Handler {
 public:
     HANDLER_DESCRIPTION("Remove items from the cluster")
+    HANDLER_USAGE("KEY ... [OPTIONS ...]")
     RemoveHandler() : Handler("rm") {}
 protected:
     void run();
@@ -133,21 +148,41 @@ protected:
 class StatsHandler : public Handler {
 public:
     HANDLER_DESCRIPTION("Retrieve cluster statistics")
-    StatsHandler() : Handler("stats") {}
+    HANDLER_USAGE("[STATS_KEY ...] [OPTIONS ...]")
+    StatsHandler() : Handler("stats"), o_keystats("keystats") {
+        o_keystats.description("Keys are document IDs. retrieve information about them");
+    }
 protected:
     void run();
+    void addOptions() {
+        Handler::addOptions();
+        parser.addOption(o_keystats);
+    }
+private:
+    cliopts::BoolOption o_keystats;
 };
 
 class VerbosityHandler : public Handler {
 public:
     HANDLER_DESCRIPTION("Modify the memcached logging level")
+    HANDLER_USAGE("<detail|debug|info|warning> [OPTIONS ...]")
     VerbosityHandler() : Handler("verbosity") {}
+protected:
+    void run();
+};
+
+class McFlushHandler : public Handler {
+public:
+    HANDLER_DESCRIPTION("Flush a memcached bucket")
+    McFlushHandler() : Handler("mcflush") {}
 protected:
     void run();
 };
 
 class ArithmeticHandler : public Handler {
 public:
+    HANDLER_USAGE("KEY ... [OPTIONS ...]")
+
     ArithmeticHandler(const char *name) : Handler(name),
         o_initial("initial"), o_delta("delta"), o_expiry("expiry") {
 
@@ -216,7 +251,7 @@ public:
 protected:
     void run();
     virtual std::string getURI() = 0;
-    virtual std::string getBody() { return ""; }
+    virtual const std::string& getBody();
     virtual std::string getContentType() { return ""; }
     virtual bool isAdmin() const { return false; }
     virtual lcb_http_method_t getMethod();
@@ -229,21 +264,27 @@ protected:
         parser.addOption(o_method);
     }
     cliopts::StringOption o_method;
+
+private:
+    std::string body_cached;
 };
 
 class AdminHandler : public HttpBaseHandler {
 public:
     HANDLER_DESCRIPTION("Invoke an administrative REST API")
+    HANDLER_USAGE("PATH ... [OPTIONS ...]")
     AdminHandler(const char *name = "admin") : HttpBaseHandler(name) {}
 protected:
     virtual void run();
     virtual std::string getURI();
     virtual bool isAdmin() const { return true; }
+
 };
 
 class BucketCreateHandler : public AdminHandler {
 public:
     HANDLER_DESCRIPTION("Create a bucket")
+    HANDLER_USAGE("NAME [OPTIONS ...]")
     BucketCreateHandler() : AdminHandler("bucket-create"),
         o_btype("bucket-type"),
         o_ramquota("ram-quota"),
@@ -272,7 +313,7 @@ protected:
     }
 
     std::string getURI() { return "/pools/default/buckets"; }
-    std::string getBody() { return body_s; }
+    const std::string& getBody() { return body_s; }
     std::string getContentType() { return "application/x-www-form-urlencoded"; }
     lcb_http_method_t getMethod() { return LCB_HTTP_METHOD_POST; }
 
@@ -289,6 +330,7 @@ private:
 class BucketDeleteHandler : public AdminHandler {
 public:
     HANDLER_DESCRIPTION("Delete a bucket")
+    HANDLER_USAGE("NAME [OPTIONS ...]")
     BucketDeleteHandler() : AdminHandler("bucket-delete") {}
 
 protected:
@@ -298,7 +340,7 @@ protected:
     }
     std::string getURI() { return std::string("/pools/default/buckets/") + bname; }
     lcb_http_method_t getMethod() { return LCB_HTTP_METHOD_DELETE; }
-
+    const std::string& getBody() { static std::string e; return e; }
 private:
     std::string bname;
 };
@@ -306,6 +348,7 @@ private:
 class BucketFlushHandler : public AdminHandler {
 public:
     HANDLER_DESCRIPTION("Flush a bucket")
+    HANDLER_USAGE("NAME [OPTIONS ...]")
     BucketFlushHandler() : AdminHandler("bucket-flush") {}
 protected:
     void run() {
@@ -319,6 +362,7 @@ protected:
         return uri;
     }
     lcb_http_method_t getMethod() { return LCB_HTTP_METHOD_POST; }
+    const std::string& getBody() { static std::string e; return e; }
 
 private:
     std::string bname;
@@ -327,6 +371,7 @@ private:
 class ViewsHandler : public HttpBaseHandler {
 public:
     HANDLER_DESCRIPTION("Query a view")
+    HANDLER_USAGE("VIEWPATH [ OPTIONS ...]")
     ViewsHandler() : HttpBaseHandler("view") {}
 protected:
     bool isAdmin() const { return false; }
@@ -334,14 +379,24 @@ protected:
     void onChunk(const char *s, size_t n) {
         fwrite(s, 1, n, stdout);
     }
+    std::string getContentType() { return "application/json"; }
 };
 
-class DsnHandler : public Handler {
+class ConnstrHandler : public Handler {
 public:
     HANDLER_DESCRIPTION("Parse a connection string and provide info on its components")
-    DsnHandler() : Handler("dsn") {}
+    HANDLER_USAGE("CONNSTR")
+    ConnstrHandler() : Handler("connstr") {}
 protected:
     void handleOptions() { }
+    void run();
+};
+
+class WriteConfigHandler : public Handler {
+public:
+    HANDLER_DESCRIPTION("Write the configuration file based on arguments passed")
+    WriteConfigHandler() : Handler("write-config") {}
+protected:
     void run();
 };
 

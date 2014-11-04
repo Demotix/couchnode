@@ -1,139 +1,79 @@
+/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+/*
+ *     Copyright 2014 Couchbase, Inc.
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ */
+
 #ifndef LCB_DURABILITY_INTERNAL_H
 #define LCB_DURABILITY_INTERNAL_H
 
+#include "simplestring.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-    /**
-     * Here is the internal API for the durability functions.
-     *
-     * Durability works on polling multiple observe responses and waiting until a
-     * key (or set of keys) have either been persisted, or the wait period has
-     * expired.
-     *
-     * We maintain two types of command counters; one is a per-iteration counter
-     * which says how many outstanding observe responses we need - this helps us
-     * ensure we don't prematurely terminate the command before all the responses
-     * are in.
-     *
-     * The second is a remaining counter; this counts how many keys do not have a
-     * conclusive observe response yet (i.e. how many do not have their criteria
-     * satisfied yet).
-     */
+/**
+ * Here is the internal API for the durability functions.
+ *
+ * Durability works on polling multiple observe responses and waiting until a
+ * key (or set of keys) have either been persisted, or the wait period has
+ * expired.
+ *
+ * The operation maintains an internal counter which counts how many keys
+ * do not have a conclusive observe response yet (i.e. how many do not have
+ * their criteria satisfied yet). The operation is considered complete when
+ * the counter reaches 0.
+ */
 
-    /**
-     * Information a single entry in a durability set
-     */
-    typedef struct lcb_durability_entry_st {
-        lcb_list_t ll;
+/**Information a single entry in a durability set. Each entry contains a single
+ * key */
+typedef struct lcb_DURITEM_st {
+    lcb_KEYBUF hashkey;
+    lcb_U64 reqcas; /**< Last known CAS for the user */
+    lcb_RESPENDURE result; /**< Result to be passed to user */
+    struct lcb_DURSET_st *parent;
+    unsigned char done; /**< Whether we have a conclusive result for this entry */
+} lcb_DURITEM;
 
-        /** Request for this structure */
-        struct lcb_durability_cmd_st request;
+/**
+ * A collection encompassing one or more entries which are to be checked for
+ * persistence
+ */
+typedef struct lcb_DURSET_st {
+    lcb_MULTICMD_CTX mctx; /**< Base class returned to user for scheduling */
+    struct lcb_durability_opts_st opts; /**< Sanitized user options */
+    struct lcb_DURITEM_st *entries; /**< Entries to poll for */
+    unsigned nentries; /**< Number of items in the array */
+    unsigned ents_alloced; /**< How many of those were allocated */
+    struct { lcb_DURITEM ent; } single; /* For when we only have a single item */
+    unsigned nremaining; /**< Number of entries remaining to poll for */
+    int waiting; /**< Set if currently awaiting an observe callback */
+    unsigned refcnt; /**< Reference count */
+    unsigned next_state; /**< Internal state */
+    genhash_t *ht; /**< Used to associate a key to its entry within dset_update */
+    lcb_string kvbufs; /**< Backing storage for key buffers */
+    const void *cookie; /**< User cookie */
+    lcb_U32 us_timeout; /**< Timestamp of next timeout */
+    void *timer;
+    lcb_t instance;
+} lcb_DURSET;
 
-        /** result for this entry */
-        struct lcb_durability_resp_st result;
-
-        /** pointer to the containing durability_set */
-        struct lcb_durability_set_st *parent;
-
-        /**
-         * flag, indicates that we're done and that it should be excluded from
-         * further operations
-         */
-        unsigned char done;
-    } lcb_durability_entry_t;
-
-    /**
-     * A collection encompassing one or more keys which are to be checked for
-     * persistence
-     */
-    typedef struct lcb_durability_set_st {
-        /** options */
-        struct lcb_durability_opts_st opts;
-
-        /** array of entries which are to be polled */
-        struct lcb_durability_entry_st *entries;
-
-        /** Allocated as well for passing to observe_ex */
-        struct lcb_durability_entry_st **valid_entries;
-
-        /** number of entries in the array */
-        lcb_size_t nentries;
-
-        struct {
-            /**
-             * Tweak for single entry, so we don't have to allocate tiny chunks
-             */
-            lcb_durability_entry_t ent;
-            lcb_durability_entry_t *entp;
-        } single;
-
-        /**
-         * How many entries have been thus far completed. The operation is
-         * complete when this number hits zero
-         */
-        lcb_size_t nremaining;
-
-        /**
-         * How many entries remain for the current iteration
-         */
-        unsigned waiting;
-
-        /**
-         * Reference count. Primarily used if we're waiting on an event
-         */
-        unsigned refcnt;
-
-        /**
-         * State. This is defined in the source file
-         */
-        unsigned next_state;
-
-        /**
-         * Hash table. Only used for multiple entries
-         */
-        genhash_t *ht;
-
-        /**
-         * User cookie
-         */
-        const void *cookie;
-
-        /**
-         * Timestamp for the timeout
-         */
-        lcb_uint32_t us_timeout;
-
-        void *timer;
-
-        lcb_t instance;
-    } lcb_durability_set_t;
-
-    void lcb_durability_update(lcb_t instance,
-                               const void *cookie,
-                               lcb_error_t err,
-                               lcb_observe_resp_t *resp);
-
-    void lcb_durability_dset_update(lcb_t instance,
-                                    lcb_durability_set_t *dset,
-                                    lcb_error_t err,
-                                    const lcb_observe_resp_t *resp);
-
-    typedef enum {
-        /** Durability requirement. Poll all servers */
-        LCB_OBSERVE_TYPE_DURABILITY,
-        /** Poll the master for simple existence */
-        LCB_OBSERVE_TYPE_CHECK,
-        /** Poll all servers only once */
-        LCB_OBSERVE_TYPE_BCAST
-    } lcb_observe_type_t;
-
-    lcb_error_t lcb_observe_ex(lcb_t instance,
-                               const void *command_cookie,
-                               lcb_size_t num,
-                               const void *const *items,
-                               lcb_observe_type_t type);
+void
+lcb_durability_dset_update(lcb_t instance, lcb_DURSET *dset, lcb_error_t err,
+    const lcb_RESPOBSERVE *resp);
+lcb_MULTICMD_CTX *
+lcb_observe_ctx_dur_new(lcb_t instance);
 
 #ifdef __cplusplus
 }

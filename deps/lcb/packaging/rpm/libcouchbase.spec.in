@@ -1,12 +1,12 @@
 Summary: Couchbase Client & Protocol Library
 Name: libcouchbase
 Version: @VERSION@
-Release: @RELEASE@
+Release: @RELEASE@%{?dist}
 Vendor: Couchbase, Inc.
 Packager: Couchbase SDK Team <support@couchbase.com>
 License: Apache-2
 Group: System Environment/Libraries
-BuildRequires: libevent-devel >= 1.4, libev-devel >= 3
+BuildRequires: libevent-devel >= 1.4, libev-devel >= 3, openssl-devel
 URL: https://github.com/couchbase/libcouchbase
 Source: @TARREDAS@.tar.gz
 BuildRoot: %{_topdir}/build/@TARREDAS@
@@ -56,7 +56,7 @@ Development files for the Couchbase Client & Protocol Library
 
 %prep
 %setup -q -n @TARREDAS@
-%configure --disable-couchbasemock --disable-tests
+%configure --disable-couchbasemock --disable-tests --disable-libuv
 
 %build
 %{__make} %{_smp_mflags}
@@ -90,6 +90,7 @@ Development files for the Couchbase Client & Protocol Library
 %defattr(-, root, root)
 %{_bindir}/cbc*
 %{_mandir}/man1/cbc*.1*
+%{_mandir}/man4/cbcrc*.4*
 
 %files devel
 %defattr(-, root, root)
@@ -98,6 +99,214 @@ Development files for the Couchbase Client & Protocol Library
 %{_libdir}/libcouchbase.so
 
 %changelog
+
+* Tue Oct 21 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.4.3-1
+
+- Disable support for SSLv3
+  This works around the _POODLE_ SSLv3 vulnerability by disabling support for
+  anything below TLSv1.
+
+  * Priority: Critical
+  * Issues: [CCBC-523](http://couchbase.com/issues/browse/CCBC-523)
+
+- Pillowfight enhancements
+  Several behavior changes were made to pillowfight in this version. These are:
+  * The `-l` or `-c -1` option is in effect by default. This means that by
+    default `pillowfight` will run an infinite number of cycles. The previous
+    behavior was to default to a single cycle, requiring an explicit `--loop`
+    to ensure the workload ran for a considerable amount of time.
+
+  * When multiple threads are used, the workload is divided among the threads,
+    thus making it that each thread only operates on a subset of the data.
+
+  * A `--sequential` option has been added to allow the workload to operate
+    in _sequence_ on the total number of items. This is useful when wishing to
+    load a bucket with many items.
+
+  * A `--start-at` option has been added to allow the workload to specify an
+    alternate range of keys; effectively allowing resumption of a previous
+    run. The `--start-at` flag allows to specify the lower bound number which
+    will be used to generate keys. Thus a `--num-items=20000` and a
+    `--start-at=10000` will generate keys from 10000 through 30000.
+
+  * The _population_ phase has now been merged with the general workload
+    implementation. This means that all worker threads will participate in
+    the population phase. The previous behavior limited the populate phase to
+    a single thread.
+
+  * If `stdout` is detected to be a terminal, a simple "OPS/SEC" meter will
+    periodically write the estimated throughput to the screen.
+
+- Fix memory leak when using large read buffers
+  In the case where large read buffers are used (and the `iovec` elements
+  becomes sizable, the library may end up incorrectly caching some memory
+  blocks for future use. This fix makes the blocks be cached at the allocator
+  level, so that they are properly (re) utilized.
+
+  * Priority: Major
+  * Issues: [CCBC-519](http://couchbase.com/issue/browse/CCBC-519)
+
+- Use forward map (and other heuristics) to get a next node for an item after
+  a not-my-vbucket reply. Since the server (see bug attached) does not always
+  guarantee that a given config is the most _correct_, the client must do some
+  guesswork in order to properly map a node when it gets a not-my-vbucket;
+  especially if the config says that the node is the correct one.
+
+  * Priority: Major
+  * Issues: [MB-12268](http://couchbase.com/issues/browse/MB-12268)
+
+* Tue Sep 23 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.4.2-1
+
+- Mark the `hashkey` fields as being _volatile_.
+  Usage of this field is not supported in many cluster systems and is thus not
+  supported functionality. It exists primarily as a legacy from an older API
+  * Priority: Major
+  * Issues: [CCBC-508](http://couchbase.com/issues/browse/CCBC-508)
+
+- Add "key stats" mode to `lcb_CMDDSTATS`.
+  This adds an additional key stats mode to the `lcb_stats3()` API
+  which interprets the `key` field as being a document ID for which
+  information (such as expiry, status) should be retrieved, rather
+  than a system statistics key. Similar functionality already exists
+  in the Java client library as `getKeyStats()`. In addition to this
+  feature, a `cbc stats --keystats` option is also provided to employ
+  this functionality from the command line.
+  * Priority: Major
+  * Issues: [CCBC-318](http://couchbase.com/issues/CCBC-318)
+
+- Add more details about replica nodes in the `cbc hash` command.
+  * Priority: Minor
+  * Issues: [CCBC-504](http://couchbase.com/issues/browse/CCBC-504)
+
+- Add `lcb_cntl()` setting to retrieve bucket name.
+  Previously the library did not have a means by which the bucket name
+  could be retrieved. Using the `LCB_CNTL_BUCKETNAME` setting, the bucket
+  name will now be returned.
+  * Priority: Major
+  * Issues: [CCBC-502](http://couchbase.com/issues/CCBC-502)
+
+* Tue Aug 26 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.4.1-1
+
+- Implement `mcflush` subcommand for `cbc`. This was removed in the cbc
+  rewrite as the previous `flush` command.
+  * Priority: Minor
+  * Issues: [CCBC-486](http://couchbase.com/issues/browse/CCBC-486)
+
+- Requests issued to an invalid replica via `lcb_get_replica()` should fail
+  with the `LCB_NO_MATCHING_SERVER_CODE`. Previously this sometimes went
+  through due to an incorrect bounds checking in the `lcbvb_vbreplica()`
+  function.
+  * Priority: Major
+  * Issues: [CCBC-488](http://couchbase.com/issues/browse/CCBC-488)
+
+- Fixed a memory leak in `lcb_get_replica()` when the operation would fail.
+  * Priority: Major
+  * Issues: [CCBC-489](http://couchbase.com/issues/browse/CCBC-489)
+    [CCBC-490](http://couchbase.com/issues/browse/CCBC-490)
+
+
+- Fix memory leak in `lcb_sched_fail()` when extended commands are in the
+  pipeline
+  * Priority: Major
+  * Issues: [CCBC-474](http://couchbase.com/issues/browse/CCBC-474)
+
+- Provide `lcb_dump()` function call to dump state information about
+  a client handle. The function call itself is currently marked as
+  volatile and the output format is very much likely to change.
+  * Priority: Minor
+  * Issues: [CCBC-491](http://couchbase.com/issues/browse/CCBC-490)
+
+
+- Fix `ratio` argument in `cbc-pillowfight`. This ensures that the
+  `ratio` argument will truly determine the ratio of gets to sets.
+  * Priority: Minor
+
+- Fix crash when HTTP request is retried. This may take place during topology
+  changes
+  * Priority: Major
+  * Issues: [CCBC-497](http://couchbase.com/issues/browse/CCBC-497)
+
+* Tue Jul 29 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.4.0-1
+
+- [major] Attempt to retry items that are mapped to a non-existent node in
+  a degraded cluster. Rather than returning `LCB_NO_MATCHING_SERVER` the
+  behavior should be to wait for the item to succeed and attempt to fetch
+  a new cluster configuration.
+
+  In order to control how such 'orphaned' commands are handled, a new value
+  has been added to the `lcb_RETRYMODEOPTS` called `LCB_RETRY_ON_MISSINGNODE`
+  which dictates how commands should be rescheduled if the associated vbucket
+  has no master. The default is to retry the command until it times out, but
+  by setting this value to `0` (See `LCB_CNTL_RETRYMODE`) it may only be
+  attempted once, causing 'fail fast' behavior in such a case.
+
+- [major] Don't throttle config requests based on initial file-based config.
+  This allows the client to quickly recover from a stale config cache without
+  waiting for the `LCB_CNTL_CONFDELAY_THRESH` interval to elapse. Prior to this
+  fix, a client would appear to "not recover" if bootstrapping from a stale cache.
+  In reality the client would eventually recover but was waiting for the delay
+  threshold to elapse.
+
+- [major] Ignore `NOT_MY_VBUCKET` config payloads if CCCP provider is disabled.
+  This allows the client to circumvent any possible bugs in the CCCP response
+  payload and rely entirely on the HTTP config. It also allows 'rewriting'
+  proxies like confsed to function.
+
+* Fri Jul 11 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.4.0-0.beta
+
+- [minor] Communication via legacy memcached servers is possible
+  by using the `memcached://` scheme in the connection string.
+
+- [minor] Environment variables understood by the library are now
+  documented in their own section.
+
+- [major] Add `lcb_get_node()` function to retrieve addresses for
+  various nodes in the cluster. This deprecates the `lcb_get_host()`,
+  `lcb_get_port()` and `lcb_get_server_list()` functions as they are
+  constrained to only return information about the administrative API.
+  The new function is configurable to return information about various
+  ports.
+
+- [major] The `dsn` field in the `lcb_create_st` structure has been
+  renamed to `connstr`.
+
+- [major] An HTTP request which has followed redirects will cause the
+  `lcb_wait()` function to never return. This bug was introduced in
+  2.4.0-DP1 and has now been fixed.
+
+- [minor] `lcb_get_server_list()` function now returns updated information
+  from the current cluster configuration. Previously this would only return
+  a node from the list specified during initial creation.
+
+- [minor] Provide additional error classifiers. Two error classifiers have
+  been added, they are:
+
+  * `LCB_ERRTYPE_SRVLOAD` which indicates that the server is likely under high load.
+  * `LCB_ERRTYPE_SRVGEN` which indicates that the error is a direct reply from the
+    server. This code can help distinguish between client and server generated
+    return codes.
+
+- [major] Provide HTTP keepalive and connection pooling for HTTP requests.
+  This allows the client to reuse an HTTP connection for multiple requests
+  rather than creating a new connection and closing it for each operation.
+
+  The functionality may be controlled via the `LCB_CNTL_HTTP_POOLSIZE` setting
+  which limits how many open connections (per server) to maintain inside the
+  client. Setting this value to `0` will disable pooling and restore old
+  behavior.
+
+- [major] Properly schedule next invocations for retry queue. A bug was introduced
+  in 2.4.0-dp1 which would cause the next tick callback to be invoked in what is
+  effectively a busy loop. This would be reflected in higher CPU load and less
+  throughput during topology changes.
+
+- [major] Return error if empty key is passed to an operation. Empty keys will
+  cause the server to drop the connection.
+  The error code returned is the newly added `LCB_EMPTY_KEY`
+
+- [minor] Provide setting to disable refreshing the configuration when an HTTP
+  API error is encountered (from one of the HTTP callback functions). This
+  adds the `LCB_CNTL_HTTP_REFRESH_CONFIG_ON_ERROR` setting.
 
 * Fri Jun 20 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.4.0-0.dp1
 
@@ -363,7 +572,7 @@ Development files for the Couchbase Client & Protocol Library
   current configuration. With memcached bootstrap this is only true if the
   configuration's `rev` field is higher than the current one.
 
-* Tue Apr 07 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.3.0-1
+* Mon Apr 07 2014 Mark Nunberg <mark.nunberg@couchbase.com> - 2.3.0-1
 
 - [major] CCBC-152: Provide a master-only observe option. This adds a new
   struct version to the `lcb_observe_cmd_t` which allows to select only the

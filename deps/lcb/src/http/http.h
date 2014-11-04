@@ -1,3 +1,20 @@
+/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+/*
+ *     Copyright 2014 Couchbase, Inc.
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ */
+
 #ifndef LCB_HTTPAPI_H
 #define LCB_HTTPAPI_H
 
@@ -47,11 +64,6 @@ struct lcb_http_request_st {
 
     /** Non-zero if caller would like to receive response in chunks */
     int chunked;
-    /** This callback will be executed when the whole response will be
-     * transferred */
-    lcb_http_complete_callback on_complete;
-    /** This callback will be executed for each chunk of the response */
-    lcb_http_data_callback on_data;
     /** The cookie belonging to this request */
     const void *command_cookie;
     /** Reference count */
@@ -72,13 +84,16 @@ struct lcb_http_request_st {
     /** Headers array for passing to callbacks */
     char **headers;
     lcbio_pTABLE io;
-    lcb_timer_t io_timer;
+    lcbio_pTIMER timer;
     lcbio_CONNREQ creq;
     lcbio_CTX *ioctx;
     lcbht_pPARSER parser;
     /** IO Timeout */
     lcb_uint32_t timeout;
 };
+
+void
+lcb_http_init_resp(const lcb_http_request_t req, lcb_RESPHTTP *res);
 
 void
 lcb_http_request_finish(lcb_t instance,
@@ -95,10 +110,5 @@ lcb_http_request_exec(lcb_http_request_t req);
 
 lcb_error_t
 lcb_http_request_connect(lcb_http_request_t req);
-
-void
-lcb_setup_lcb_http_resp_t(lcb_http_resp_t *resp,
-    lcb_http_status_t status, const char *path, lcb_size_t npath,
-    const char *const *headers, const void *bytes, lcb_size_t nbytes);
 
 #endif

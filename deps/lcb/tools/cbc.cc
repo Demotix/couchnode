@@ -8,7 +8,7 @@
 #include "common/options.h"
 #include "common/histogram.h"
 #include "cbc-handlers.h"
-#include "dsn.h"
+#include "connspec.h"
 using namespace cbc;
 
 using std::string;
@@ -16,10 +16,13 @@ using std::map;
 using std::vector;
 using std::stringstream;
 
-template <typename T>
-string getRespKey(const T* resp)
+string getRespKey(const lcb_RESPBASE* resp)
 {
-    return string((const char*)resp->v.v0.key, resp->v.v0.nkey);
+    if (!resp->nkey) {
+        return "";
+    }
+
+    return string((const char *)resp->key, resp->nkey);
 }
 
 static void
@@ -28,135 +31,145 @@ printKeyError(string& key, lcb_error_t err)
     fprintf(stderr, "%-20s %s (0x%x)\n", key.c_str(), lcb_strerror(NULL, err), err);
 }
 
-template <typename T> void
-printKeyCasStatus(string& key, const T* resp, const char *message = NULL)
+static void
+printKeyCasStatus(string& key, const lcb_RESPBASE *resp, const char *message = NULL)
 {
     fprintf(stderr, "%-20s", key.c_str());
     if (message != NULL) {
         fprintf(stderr, "%s ", message);
     }
-    fprintf(stderr, "CAS=0x%"PRIx64"\n", resp->v.v0.cas);
+    fprintf(stderr, "CAS=0x%"PRIx64"\n", resp->cas);
 }
 
 extern "C" {
 static void
-get_callback(lcb_t, const void *, lcb_error_t err, const lcb_get_resp_t *resp)
+get_callback(lcb_t, lcb_CALLBACKTYPE, const lcb_RESPGET *resp)
 {
-    string key = getRespKey(resp);
-    if (err == LCB_SUCCESS) {
-        fprintf(stderr, "%-20s CAS=0x%"PRIx64", Flags=0x%x, Datatype=0x%x\n",
-            key.c_str(), resp->v.v0.cas, resp->v.v0.flags, resp->v.v0.datatype);
-        fwrite(resp->v.v0.bytes, 1, resp->v.v0.nbytes, stdout);
+    string key = getRespKey((const lcb_RESPBASE *)resp);
+    if (resp->rc == LCB_SUCCESS) {
+        fprintf(stderr, "%-20s CAS=0x%"PRIx64", Flags=0x%x. Size=%lu\n",
+            key.c_str(), resp->cas, resp->itmflags, (unsigned long)resp->nvalue);
+        fflush(stderr);
+        fwrite(resp->value, 1, resp->nvalue, stdout);
+        fflush(stdout);
         fprintf(stderr, "\n");
     } else {
-        printKeyError(key, err);
+        printKeyError(key, resp->rc);
     }
 }
+
 static void
-store_callback(lcb_t, const void *cookie,
-    lcb_storage_t, lcb_error_t err, const lcb_store_resp_t *resp)
+store_callback(lcb_t, lcb_CALLBACKTYPE, const lcb_RESPSTORE *resp)
 {
-    string key = getRespKey(resp);
-    if (err == LCB_SUCCESS) {
-        printKeyCasStatus(key, resp, "Stored.");
-        if (cookie != NULL) {
-            map<string,lcb_cas_t>& items = *(map<string,lcb_cas_t>*)cookie;
-            items[key] = resp->v.v0.cas;
+    string key = getRespKey((const lcb_RESPBASE*)resp);
+    if (resp->rc == LCB_SUCCESS) {
+        printKeyCasStatus(key, (const lcb_RESPBASE *)resp, "Stored.");
+        if (resp->cookie != NULL) {
+            map<string,lcb_cas_t>& items = *(map<string,lcb_cas_t>*)resp->cookie;
+            items[key] = resp->cas;
         }
     } else {
-        printKeyError(key, err);
+        printKeyError(key, resp->rc);
     }
 }
+
 static void
-durability_callback(lcb_t, const void*, lcb_error_t err, const lcb_durability_resp_t *resp)
+common_callback(lcb_t, int type, const lcb_RESPBASE *resp)
 {
     string key = getRespKey(resp);
-    if (err == LCB_SUCCESS) {
-        err = resp->v.v0.err;
+    if (resp->rc != LCB_SUCCESS) {
+        printKeyError(key, resp->rc);
+        return;
     }
-    if (err == LCB_SUCCESS) {
+    switch (type) {
+    case LCB_CALLBACK_UNLOCK:
+        fprintf(stderr, "%-20s Unlocked\n", key.c_str());
+        break;
+    case LCB_CALLBACK_REMOVE:
+        printKeyCasStatus(key, resp, "Deleted.");
+        break;
+    case LCB_CALLBACK_ENDURE:
         printKeyCasStatus(key, resp, "Persisted/Replicated.");
-    } else {
-        printKeyError(key, err);
+        break;
+    default:
+        abort(); // didn't request it
     }
 }
+
 static void
-observe_callback(lcb_t, const void*,  lcb_error_t err, const lcb_observe_resp_t *resp)
+observe_callback(lcb_t, lcb_CALLBACKTYPE, const lcb_RESPOBSERVE *resp)
 {
-    if (resp->v.v0.nkey == 0) {
+    if (resp->nkey == 0) {
         return;
     }
 
-    string key = getRespKey(resp);
-    if (err == LCB_SUCCESS) {
+    string key = getRespKey((const lcb_RESPBASE *)resp);
+    if (resp->rc == LCB_SUCCESS) {
         fprintf(stderr,
             "%-20s [%s] Status=0x%x, CAS=0x%"PRIx64"\n", key.c_str(),
-            resp->v.v0.from_master ? "Master" : "Replica",
-                    resp->v.v0.status, resp->v.v0.cas);
+            resp->ismaster ? "Master" : "Replica",
+                    resp->status, resp->cas);
     } else {
-        printKeyError(key, err);
+        printKeyError(key, resp->rc);
     }
 }
+
 static void
-unlock_callback(lcb_t, const void*, lcb_error_t err, const lcb_unlock_resp_t *resp)
+stats_callback(lcb_t, lcb_CALLBACKTYPE, const lcb_RESPSTATS *resp)
 {
-    string key = getRespKey(resp);
-    if (err != LCB_SUCCESS) {
-        printKeyError(key, err);
-    } else {
-        fprintf(stderr, "%-20s Unlocked\n", key.c_str());
-    }
-}
-static void
-remove_callback(lcb_t, const void*, lcb_error_t err, const lcb_remove_resp_t *resp)
-{
-    string key = getRespKey(resp);
-    if (err != LCB_SUCCESS) {
-        printKeyError(key, err);
-    } else {
-        printKeyCasStatus(key, resp, "Removed.");
-    }
-}
-static void
-stats_callback(lcb_t, const void *, lcb_error_t err, const lcb_server_stat_resp_t *resp)
-{
-    if (err != LCB_SUCCESS) {
-        fprintf(stderr, "Got error %s (%d) in stats\n", lcb_strerror(NULL, err), err);
+    if (resp->rc != LCB_SUCCESS) {
+        fprintf(stderr, "Got error %s (%d) in stats\n", lcb_strerror(NULL, resp->rc), resp->rc);
         return;
     }
-    if (resp->v.v0.server_endpoint == NULL || resp->v.v0.key == NULL) {
+    if (resp->server == NULL || resp->key == NULL) {
         return;
     }
 
-    string server = resp->v.v0.server_endpoint;
-    string key = getRespKey(resp);
+    string server = resp->server;
+    string key = getRespKey((const lcb_RESPBASE *)resp);
     string value;
-    if (resp->v.v0.nbytes > 0) {
-        value.assign((const char *)resp->v.v0.bytes, resp->v.v0.nbytes);
+    if (resp->nvalue >  0) {
+        value.assign((const char *)resp->value, resp->nvalue);
     }
-    fprintf(stderr, "%s\t%s", server.c_str(), key.c_str());
+    fprintf(stdout, "%s\t%s", server.c_str(), key.c_str());
     if (!value.empty()) {
-        fprintf(stderr, "\t%s", value.c_str());
+        fprintf(stdout, "\t%s", value.c_str());
     }
-    fprintf(stderr, "\n");
+    fprintf(stdout, "\n");
 }
+
 static void
-verbosity_callback(lcb_t,const void*, lcb_error_t err, const lcb_verbosity_resp_st *resp)
+common_server_callback(lcb_t, int cbtype, const lcb_RESPSERVERBASE *sbase)
 {
-    if (err != LCB_SUCCESS && resp->v.v0.server_endpoint) {
-        fprintf(stderr, "Failed to set verbosity for %s\n", resp->v.v0.server_endpoint);
+    const char *msg;
+    if (cbtype == LCB_CALLBACK_VERBOSITY) {
+        msg = "Set verbosity";
+    } else if (cbtype == LCB_CALLBACK_FLUSH) {
+        msg = "Flush";
+    } else {
+        msg = "";
+    }
+    if (!sbase->server) {
+        return;
+    }
+    if (sbase->rc != LCB_SUCCESS) {
+        fprintf(stderr, "%s failed for server %s: %s\n", msg, sbase->server,
+            lcb_strerror(NULL, sbase->rc));
+    } else {
+        fprintf(stderr, "%s: %s\n", msg, sbase->server);
     }
 }
+
 static void
-arithmetic_callback(lcb_t, const void*, lcb_error_t err, const lcb_arithmetic_resp_t *resp)
+arithmetic_callback(lcb_t, lcb_CALLBACKTYPE, const lcb_RESPCOUNTER *resp)
 {
-    string key = getRespKey(resp);
-    if (err != LCB_SUCCESS) {
-        printKeyError(key, err);
+    string key = getRespKey((const lcb_RESPBASE *)resp);
+    if (resp->rc != LCB_SUCCESS) {
+        printKeyError(key, resp->rc);
     } else {
         char buf[4096] = { 0 };
-        sprintf(buf, "Current value is %"PRIu64".", resp->v.v0.value);
-        printKeyCasStatus(key, resp, buf);
+        sprintf(buf, "Current value is %"PRIu64".", resp->value);
+        printKeyCasStatus(key, (const lcb_RESPBASE *)resp, buf);
     }
 }
 static void
@@ -188,6 +201,9 @@ Handler::Handler(const char *name) : parser(name), instance(NULL)
 
 Handler::~Handler()
 {
+    if (params.shouldDump()) {
+        lcb_dump(instance, stderr, LCB_DUMP_ALL);
+    }
     if (instance) {
         lcb_destroy(instance);
     }
@@ -197,6 +213,8 @@ void
 Handler::execute(int argc, char **argv)
 {
     addOptions();
+    parser.default_settings.argstring = usagestr();
+    parser.default_settings.shortdesc = description();
     parser.parse(argc, argv, true);
     run();
     if (instance != NULL && params.useTimings()) {
@@ -239,11 +257,16 @@ Handler::run()
 }
 
 const string&
-Handler::getRequiredArg()
+Handler::getLoneArg(bool required)
 {
+    static string empty("");
+
     const vector<string>& args = parser.getRestArgs();
     if (args.empty() || args.size() != 1) {
-        throw "Command requires single argument";
+        if (required) {
+            throw "Command requires single argument";
+        }
+        return empty;
     }
     return args[0];
 }
@@ -268,7 +291,8 @@ void
 GetHandler::run()
 {
     Handler::run();
-    lcb_set_get_callback(instance, get_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_GET, (lcb_RESPCALLBACK)get_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_GETREPLICA, (lcb_RESPCALLBACK)get_callback);
     const vector<string>& keys = parser.getRestArgs();
     lcb_error_t err;
 
@@ -278,7 +302,7 @@ GetHandler::run()
         const string& key = keys[ii];
         LCB_KREQ_SIMPLE(&cmd.key, key.c_str(), key.size());
         if (o_exptime.passed()) {
-            cmd.options.exptime = o_exptime.result();
+            cmd.exptime = o_exptime.result();
         }
         if (isLock()) {
             cmd.lock = 1;
@@ -297,28 +321,34 @@ static void
 endureItems(lcb_t instance, const map<string,lcb_cas_t> items,
     size_t persist_to, size_t replicate_to)
 {
-    lcb_set_durability_callback(instance, durability_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_ENDURE, common_callback);
     lcb_durability_opts_t options = { 0 };
-    vector<lcb_durability_cmd_t> cmds;
-    vector<const lcb_durability_cmd_t *> cmdlist;
     options.v.v0.persist_to = persist_to;
     options.v.v0.replicate_to = replicate_to;
     lcb_error_t err;
 
-    map<string,lcb_cas_t>::const_iterator iter;
-    for (iter = items.begin(); iter != items.end(); ++iter) {
-        lcb_durability_cmd_t cmd = { 0 };
-        cmd.v.v0.key = iter->first.c_str();
-        cmd.v.v0.nkey = iter->first.size();
-        cmd.v.v0.cas = iter->second;
-        cmds.push_back(cmd);
+    lcb_MULTICMD_CTX *mctx = lcb_endure3_ctxnew(instance, &options, &err);
+    if (mctx == NULL) {
+        throw err;
     }
 
-    for (size_t ii = 0; ii < cmds.size(); ++ii) {
-        cmdlist.push_back(&cmds[ii]);
+    map<string,lcb_cas_t>::const_iterator iter;
+    for (iter = items.begin(); iter != items.end(); ++iter) {
+        lcb_CMDENDURE cmd = { 0 };
+        LCB_KREQ_SIMPLE(&cmd.key, iter->first.c_str(), iter->first.size());
+        cmd.cas = iter->second;
+        err = mctx->addcmd(mctx, (lcb_CMDBASE *)&cmd);
+        if (err != LCB_SUCCESS) {
+            throw err;
+        }
     }
-    err = lcb_durability_poll(instance, NULL, &options, cmds.size(), &cmdlist[0]);
-    if (err != LCB_SUCCESS) {
+
+    lcb_sched_enter(instance);
+    err = mctx->done(mctx, NULL);
+    if (err == LCB_SUCCESS) {
+        lcb_sched_leave(instance);
+    } else {
+        lcb_sched_fail(instance);
         throw err;
     }
     lcb_wait(instance);
@@ -353,7 +383,7 @@ SetHandler::storeItem(const string& key, const char *value, size_t nvalue)
         cmd.datatype = LCB_VALUE_F_JSON;
     }
     if (o_exp.passed()) {
-        cmd.options.exptime = o_exp.result();
+        cmd.exptime = o_exp.result();
     }
     if (o_flags.passed()) {
         cmd.flags = o_flags.result();
@@ -385,7 +415,7 @@ void
 SetHandler::run()
 {
     Handler::run();
-    lcb_set_store_callback(instance, store_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_STORE, (lcb_RESPCALLBACK)store_callback);
     const vector<string>& keys = parser.getRestArgs();
 
     lcb_sched_enter(instance);
@@ -440,13 +470,26 @@ HashHandler::run()
         lcbvb_map_key(vbc, vkey, key.size(), &vbid, &srvix);
         fprintf(stderr, "%s: [vBucket=%d, Index=%d]", key.c_str(), vbid, srvix);
         if (srvix != -1) {
-            fprintf(stderr, " Server: %s", vbucket_config_get_server(vbc, srvix));
-            const char *vapi = vbucket_config_get_couch_api_base(vbc, srvix);
+            fprintf(stderr, " Server: %s",
+                lcbvb_get_hostport(vbc, srvix, LCBVB_SVCTYPE_DATA, LCBVB_SVCMODE_PLAIN));
+            const char *vapi = lcbvb_get_capibase(vbc, srvix, LCBVB_SVCMODE_PLAIN);
             if (vapi) {
                 fprintf(stderr, ", CouchAPI: %s", vapi);
             }
         }
         fprintf(stderr, "\n");
+
+        for (size_t jj = 0; jj < lcbvb_get_nreplicas(vbc); jj++) {
+            int rix = lcbvb_vbreplica(vbc, vbid, jj);
+            const char *rname = NULL;
+            if (rix >= 0) {
+                rname = lcbvb_get_hostport(vbc, rix, LCBVB_SVCTYPE_DATA, LCBVB_SVCMODE_PLAIN);
+            }
+            if (rname == NULL) {
+                rname = "N/A";
+            }
+            fprintf(stderr, "Replica #%d: Index=%d, Host=%s\n", (int)jj, rix, rname);
+        }
     }
 }
 
@@ -454,33 +497,39 @@ void
 ObserveHandler::run()
 {
     Handler::run();
-    lcb_set_observe_callback(instance, observe_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_OBSERVE, (lcb_RESPCALLBACK)observe_callback);
     const vector<string>& keys = parser.getRestArgs();
-    vector<lcb_observe_cmd_t> cmds;
-    vector<const lcb_observe_cmd_t*> cmdlist;
-    for (size_t ii = 0; ii < keys.size(); ii++) {
-        lcb_observe_cmd_t cmd;
-        memset(&cmd, 0, sizeof cmd);
-        cmd.v.v0.key = (const void *)keys[ii].c_str();
-        cmd.v.v0.nkey = keys[ii].size();
-        cmds.push_back(cmd);
+    lcb_MULTICMD_CTX *mctx = lcb_observe3_ctxnew(instance);
+    if (mctx == NULL) {
+        throw LCB_CLIENT_ENOMEM;
     }
-    for (size_t ii = 0; ii < cmds.size(); ii++) {
-        cmdlist.push_back(&cmds[ii]);
-    }
+
     lcb_error_t err;
-    err = lcb_observe(instance, NULL, cmds.size(), &cmdlist[0]);
-    if (err != LCB_SUCCESS) {
+    for (size_t ii = 0; ii < keys.size(); ii++) {
+        lcb_CMDOBSERVE cmd = { 0 };
+        LCB_KREQ_SIMPLE(&cmd.key, keys[ii].c_str(), keys[ii].size());
+        err = mctx->addcmd(mctx, (lcb_CMDBASE*)&cmd);
+        if (err != LCB_SUCCESS) {
+            throw err;
+        }
+    }
+
+    lcb_sched_enter(instance);
+    err = mctx->done(mctx, NULL);
+    if (err == LCB_SUCCESS) {
+        lcb_sched_leave(instance);
+        lcb_wait(instance);
+    } else {
+        lcb_sched_fail(instance);
         throw err;
     }
-    lcb_wait(instance);
 }
 
 void
 UnlockHandler::run()
 {
     Handler::run();
-    lcb_set_unlock_callback(instance, unlock_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_UNLOCK, common_callback);
     const vector<string>& args = parser.getRestArgs();
 
     if (args.size() % 2) {
@@ -500,7 +549,7 @@ UnlockHandler::run()
         lcb_CMDUNLOCK cmd;
         memset(&cmd, 0, sizeof cmd);
         LCB_KREQ_SIMPLE(&cmd.key, key.c_str(), key.size());
-        cmd.options.cas = cas;
+        cmd.cas = cas;
         lcb_error_t err = lcb_unlock3(instance, NULL, &cmd);
         if (err != LCB_SUCCESS) {
             throw err;
@@ -546,8 +595,6 @@ VersionHandler::run()
         fprintf(stderr, "  IO: Default=%s, Current=%s\n",
             iops_to_string(info.v.v0.os_default), iops_to_string(info.v.v0.effective));
     }
-    printf("  Compression (snappy): .. %s\n",
-            lcb_supports_feature(LCB_SUPPORTS_SNAPPY) ? "SUPPORTED" : "NOT SUPPORTED");
     printf("  SSL: .. %s\n",
             lcb_supports_feature(LCB_SUPPORTS_SSL) ? "SUPPORTED" : "NOT SUPPORTED");
 }
@@ -558,7 +605,7 @@ RemoveHandler::run()
     Handler::run();
     const vector<string> &keys = parser.getRestArgs();
     lcb_sched_enter(instance);
-    lcb_set_remove_callback(instance, remove_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_REMOVE, common_callback);
     for (size_t ii = 0; ii < keys.size(); ++ii) {
         lcb_CMDREMOVE cmd;
         const string& key = keys[ii];
@@ -577,7 +624,7 @@ void
 StatsHandler::run()
 {
     Handler::run();
-    lcb_set_stat_callback(instance, stats_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_STATS, (lcb_RESPCALLBACK)stats_callback);
     vector<string> keys = parser.getRestArgs();
     if (keys.empty()) {
         keys.push_back("");
@@ -588,6 +635,9 @@ StatsHandler::run()
         const string& key = keys[ii];
         if (!key.empty()) {
             LCB_KREQ_SIMPLE(&cmd.key, key.c_str(), key.size());
+            if (o_keystats.result()) {
+                cmd.cmdflags = LCB_CMDSTATS_F_KV;
+            }
         }
         lcb_error_t err = lcb_stats3(instance, NULL, &cmd);
         if (err != LCB_SUCCESS) {
@@ -601,6 +651,8 @@ StatsHandler::run()
 void
 VerbosityHandler::run()
 {
+    Handler::run();
+
     const string& slevel = getRequiredArg();
     lcb_verbosity_level_t level;
     if (slevel == "detail") {
@@ -615,7 +667,7 @@ VerbosityHandler::run()
         throw "Verbosity level must be {detail,debug,info,warning}";
     }
 
-    lcb_set_verbosity_callback(instance, verbosity_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_VERBOSITY, (lcb_RESPCALLBACK)common_server_callback);
     lcb_CMDVERBOSITY cmd = { 0 };
     cmd.level = level;
     lcb_error_t err;
@@ -629,24 +681,41 @@ VerbosityHandler::run()
 }
 
 void
+McFlushHandler::run()
+{
+    Handler::run();
+
+    lcb_CMDFLUSH cmd = { 0 };
+    lcb_error_t err;
+    lcb_install_callback3(instance, LCB_CALLBACK_FLUSH, (lcb_RESPCALLBACK)common_server_callback);
+    lcb_sched_enter(instance);
+    err = lcb_flush3(instance, NULL, &cmd);
+    if (err != LCB_SUCCESS) {
+        throw err;
+    }
+    lcb_sched_leave(instance);
+    lcb_wait(instance);
+}
+
+void
 ArithmeticHandler::run()
 {
     Handler::run();
 
     const vector<string>& keys = parser.getRestArgs();
-    lcb_set_arithmetic_callback(instance, arithmetic_callback);
+    lcb_install_callback3(instance, LCB_CALLBACK_COUNTER, (lcb_RESPCALLBACK)arithmetic_callback);
     lcb_sched_enter(instance);
     for (size_t ii = 0; ii < keys.size(); ++ii) {
         const string& key = keys[ii];
-        lcb_CMDINCRDECR cmd = { 0 };
+        lcb_CMDCOUNTER cmd = { 0 };
         LCB_KREQ_SIMPLE(&cmd.key, key.c_str(), key.size());
         if (o_initial.passed()) {
             cmd.create = 1;
             cmd.initial = o_initial.result();
         }
         cmd.delta = getDelta();
-        cmd.options.exptime = o_expiry.result();
-        lcb_error_t err = lcb_arithmetic3(instance, NULL, &cmd);
+        cmd.exptime = o_expiry.result();
+        lcb_error_t err = lcb_counter3(instance, NULL, &cmd);
         if (err != LCB_SUCCESS) {
             throw err;
         }
@@ -688,7 +757,7 @@ HttpBaseHandler::run()
     lcb_http_cmd_st cmd;
     memset(&cmd, 0, sizeof cmd);
     string uri = getURI();
-    string body = getBody();
+    const string& body = getBody();
 
     cmd.v.v0.method = getMethod();
     cmd.v.v0.chunked = 1;
@@ -730,6 +799,25 @@ HttpBaseHandler::getMethod()
     } else {
         throw "Unrecognized method string";
     }
+}
+
+const string&
+HttpBaseHandler::getBody()
+{
+    if (!body_cached.empty()) {
+        return body_cached;
+    }
+    lcb_http_method_t meth = getMethod();
+    if (meth == LCB_HTTP_METHOD_GET || meth == LCB_HTTP_METHOD_DELETE) {
+        return body_cached; // empty
+    }
+
+    char buf[4096];
+    size_t nr;
+    while ( (nr = fread(buf, 1, sizeof buf, stdin)) != 0) {
+        body_cached.append(buf, nr);
+    }
+    return body_cached;
 }
 
 void
@@ -810,24 +898,24 @@ struct HostEnt {
 };
 
 void
-DsnHandler::run()
+ConnstrHandler::run()
 {
-    const string& dsn_s = getRequiredArg();
+    const string& connstr_s = getRequiredArg();
     lcb_error_t err;
     const char *errmsg;
-    lcb_DSNPARAMS dsn;
-    memset(&dsn, 0, sizeof dsn);
-    err = lcb_dsn_parse(dsn_s.c_str(), &dsn, &errmsg);
+    lcb_CONNSPEC spec;
+    memset(&spec, 0, sizeof spec);
+    err = lcb_connspec_parse(connstr_s.c_str(), &spec, &errmsg);
     if (err != LCB_SUCCESS) {
         throw errmsg;
     }
 
-    printf("Bucket: %s\n", dsn.bucket);
-    printf("Implicit port: %d\n", dsn.implicit_port);
+    printf("Bucket: %s\n", spec.bucket);
+    printf("Implicit port: %d\n", spec.implicit_port);
     string sslOpts;
-    if (dsn.sslopts & LCB_SSL_ENABLED) {
+    if (spec.sslopts & LCB_SSL_ENABLED) {
         sslOpts = "ENABLED";
-        if (dsn.sslopts & LCB_SSL_NOVERIFY) {
+        if (spec.sslopts & LCB_SSL_NOVERIFY) {
             sslOpts += "|NOVERIFY";
         }
     }
@@ -836,10 +924,10 @@ DsnHandler::run()
     printf("Boostrap Protocols: ");
     string bsStr;
     for (size_t ii = 0; ii < LCB_CONFIG_TRANSPORT_MAX; ii++) {
-        if (dsn.transports[ii] == LCB_CONFIG_TRANSPORT_LIST_END) {
+        if (spec.transports[ii] == LCB_CONFIG_TRANSPORT_LIST_END) {
             break;
         }
-        switch (dsn.transports[ii]) {
+        switch (spec.transports[ii]) {
         case LCB_CONFIG_TRANSPORT_CCCP:
             bsStr += "CCCP,";
             break;
@@ -860,11 +948,11 @@ DsnHandler::run()
     lcb_list_t *llcur;
     vector<HostEnt> hosts;
 
-    LCB_LIST_FOR(llcur, &dsn.hosts) {
-        lcb_DSNHOST *dh = LCB_LIST_ITEM(llcur, lcb_DSNHOST, llnode);
+    LCB_LIST_FOR(llcur, &spec.hosts) {
+        lcb_HOSTSPEC *dh = LCB_LIST_ITEM(llcur, lcb_HOSTSPEC, llnode);
         lcb_U16 port = dh->port;
         if (!port) {
-            port = dsn.implicit_port;
+            port = spec.implicit_port;
         }
 
         if (dh->type == LCB_CONFIG_MCD_PORT) {
@@ -876,7 +964,7 @@ DsnHandler::run()
         } else if (dh->type == LCB_CONFIG_HTTP_SSL_PORT) {
             hosts.push_back(HostEnt(dh->hostname, "restapi+ssl", port));
         } else {
-            if (dsn.sslopts) {
+            if (spec.sslopts) {
                 hosts.push_back(HostEnt(dh->hostname, "memcached+ssl", LCB_CONFIG_MCD_SSL_PORT));
                 hosts.push_back(HostEnt(dh->hostname, "restapi+ssl", LCB_CONFIG_HTTP_SSL_PORT));
             } else {
@@ -894,9 +982,22 @@ DsnHandler::run()
     printf("Options: \n");
     const char *key, *value;
     int ictx = 0;
-    while (lcb_dsn_next_option(&dsn, &key, &value, &ictx)) {
+    while (lcb_connspec_next_option(&spec, &key, &value, &ictx)) {
         printf("  %s=%s\n", key, value);
     }
+}
+
+void
+WriteConfigHandler::run()
+{
+    lcb_create_st cropts;
+    params.fillCropts(cropts);
+    string outname = getLoneArg();
+    if (outname.empty()) {
+        outname = ConnParams::getConfigfileName();
+    }
+    // Generate the config
+    params.writeConfig(outname);
 }
 
 static map<string,Handler*> handlers;
@@ -908,7 +1009,7 @@ static const char* optionsOrder[] = {
         "observe",
         "incr",
         "decr",
-        // "flush",
+        "mcflush",
         "hash",
         "lock",
         "unlock",
@@ -922,7 +1023,8 @@ static const char* optionsOrder[] = {
         "bucket-create",
         "bucket-delete",
         "bucket-flush",
-        "dsn",
+        "connstr",
+        "write-config",
         NULL
 };
 
@@ -937,7 +1039,7 @@ protected:
         for (const char ** cur = optionsOrder; *cur; cur++) {
             const Handler *handler = handlers[*cur];
             fprintf(stderr, "   %-20s", *cur);
-            fprintf(stderr, "%s\n", handler->description().c_str());
+            fprintf(stderr, "%s\n", handler->description());
         }
     }
 };
@@ -957,6 +1059,7 @@ setupHandlers()
     handlers_s["cp"] = new SetHandler("cp");
     handlers_s["stats"] = new StatsHandler();
     handlers_s["verbosity"] = new VerbosityHandler();
+    handlers_s["mcflush"] = new McFlushHandler();
     handlers_s["incr"] = new IncrHandler();
     handlers_s["decr"] = new DecrHandler();
     handlers_s["admin"] = new AdminHandler();
@@ -964,7 +1067,8 @@ setupHandlers()
     handlers_s["bucket-delete"] = new BucketDeleteHandler();
     handlers_s["bucket-flush"] = new BucketFlushHandler();
     handlers_s["view"] = new ViewsHandler();
-    handlers_s["dsn"] = new DsnHandler();
+    handlers_s["connstr"] = new ConnstrHandler();
+    handlers_s["write-config"] = new WriteConfigHandler();
 
 
 
@@ -976,25 +1080,101 @@ setupHandlers()
     handlers["cat"] = handlers["get"];
 }
 
-int main(int argc, char **argv)
-{
-    setupHandlers();
+#if _POSIX_VERSION >= 200112L
+#include <libgen.h>
+#define HAVE_BASENAME
+#endif
 
-    if (argc < 2) {
-        fprintf(stderr, "Must provide an option name\n");
-        HelpHandler().execute(argc, argv);
-        exit(EXIT_FAILURE);
+static void
+parseCommandname(string& cmdname, int& argc, char**& argv)
+{
+#ifdef HAVE_BASENAME
+    cmdname = basename(argv[0]);
+    size_t dashpos;
+
+    if (cmdname.find("cbc") != 0) {
+        cmdname.clear();
+        // Doesn't start with cbc
+        return;
     }
 
-    Handler *handler = handlers[argv[1]];
+    if ((dashpos = cmdname.find('-')) != string::npos &&
+            cmdname.find("cbc") != string::npos &&
+            dashpos+1 < cmdname.size()) {
+
+        // Get the actual command name
+        cmdname = cmdname.substr(dashpos+1);
+        return;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
+    cmdname.clear();
+}
+
+static void
+wrapPillowfight(int argc, char **argv)
+{
+#ifdef _POSIX_VERSION
+    vector<char *> args;
+    string exePath(argv[0]);
+    size_t cbc_pos = exePath.find("cbc");
+
+    if (cbc_pos == string::npos) {
+        throw("Couldn't invoke pillowfight");
+    }
+
+    exePath.replace(cbc_pos, 3, "cbc-pillowfight");
+    args.push_back((char*)exePath.c_str());
+
+    // { "cbc", "pillowfight" }
+    argv += 2; argc -= 2;
+    for (int ii = 0; ii < argc; ii++) {
+        args.push_back(argv[ii]);
+    }
+    args.push_back((char*)NULL);
+    execvp(exePath.c_str(), &args[0]);
+    perror(exePath.c_str());
+    throw("Couldn't execute!");
+#else
+    throw ("Can't wrap around cbc-pillowfight on non-POSIX environments");
+#endif
+}
+
+int main(int argc, char **argv)
+{
+
+    // Wrap pillowfight immediately
+    if (argc >= 2 && strcmp(argv[1], "pillowfight") == 0) {
+        wrapPillowfight(argc, argv);
+    }
+
+    setupHandlers();
+    string cmdname;
+    parseCommandname(cmdname, argc, argv);
+
+    if (cmdname.empty()) {
+        if (argc < 2) {
+            fprintf(stderr, "Must provide an option name\n");
+            HelpHandler().execute(argc, argv);
+            exit(EXIT_FAILURE);
+        } else {
+            cmdname = argv[1];
+            argv++;
+            argc--;
+        }
+    }
+
+    Handler *handler = handlers[cmdname];
     if (handler == NULL) {
-        fprintf(stderr, "Unknown command %s\n", argv[1]);
+        fprintf(stderr, "Unknown command %s\n", cmdname.c_str());
         HelpHandler().execute(argc, argv);
         exit(EXIT_FAILURE);
     }
 
     try {
-        handler->execute(argc-1, argv+1);
+        handler->execute(argc, argv);
     } catch (lcb_error_t &err) {
         fprintf(stderr, "Operation failed with code 0x%x (%s)\n",
             err, lcb_strerror(NULL, err));

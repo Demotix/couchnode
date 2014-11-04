@@ -158,38 +158,17 @@ $ xdg-open doc/html/index.html # Linux
 $ open doc/html/index.html # OS X
 ```
 
-To generate the documentation for the library's internals:
+You may also generate documentation using the `doc/Makefile` which dynamically
+inserts version information
 
 ```
-$ ./doc/gen_internal_apidoc.sh
+$ make -f doc/Makefile public # for public documentation
+$ make -f doc/Makefile internal # for internal documentation
 ```
 
-The documentation will contain the public as well as internal APIs
-within the `doc/html` directory.
-
-## Contributing
-
-In addition to filing bugs, you may contribute by submitting patches
-to fix bugs in the library. Contributions may be submitting to
-<http://review.couchbase.com>.  We use Gerrit as our code review system -
-and thus submitting a change would require an account there. Note that
-pull requests will not be ignored but will be responded to much quicker
-once they are converted into Gerrit.
-
-For something to be accepted into the codebase, it must be formatted
-properly and have undergone proper testing. While there are no formatting
-guidelines per se, the code should look similar to the existing code
-within the library.
-
-## Branches and Tags
-
-Released versions of the library are marked as annotated tags inside
-the repository.
-
-* The `release10` contains the older 1.x versions of the library.
-* The `release23` contains the current 2.3.x maintenance branch
-* The `master` branch represents the mainline branch. The master
-  branch typically consists of content going into the next release.
+The generated documentation will be in the `doc/public/html` directory for
+public documentation, and in the `doc/internal/html` directory for internal
+documentation.
 
 ## Contributors
 
